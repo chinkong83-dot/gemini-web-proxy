@@ -1,30 +1,32 @@
 #!/bin/bash
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+python_bin="${PYTHON:-python3}"
 
 echo "Setting up Gemini Web Proxy for OpenCode..."
 echo "=========================================="
 
-# Check Python version
-python_version=$(python3 --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+')
-if [[ $(echo "$python_version >= 3.8" | bc -l) -eq 0 ]]; then
+if ! "$python_bin" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)'; then
     echo "Error: Python 3.8 or higher is required"
     exit 1
 fi
 
-echo "✓ Python version check passed"
+echo "✓ Python version check passed: $("$python_bin" --version)"
 
 # Install Python dependencies
 echo "Installing Python dependencies..."
-pip3 install -r requirements.txt
+"$python_bin" -m pip install -r requirements.txt
 
 # Install Playwright browsers
 echo "Installing Playwright browsers..."
-playwright install chromium
+"$python_bin" -m playwright install chromium
 
 echo ""
 echo "Setup complete!"
 echo ""
 echo "Next steps:"
-echo "1. Run: python3 run.py"
+echo "1. Run: $python_bin run.py"
 echo "2. Log in to your Google account when browser opens"
 echo "3. Configure OpenCode with the provider settings from README.md"
 echo ""
