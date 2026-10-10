@@ -165,14 +165,32 @@ The Chrome process must keep running, but its window does not need to be visible
 The default mode hides the browser after login. Do not manually close the proxy's
 browser or session tabs while requests are being processed.
 
-### Choosing the Gemini Model
+### Showing or Hiding Chrome
 
-To show the proxy's own logged-in Chrome window, stop the proxy and restart it:
+To temporarily hide a visible window without restarting the proxy, click the
+yellow minimize button in the Chrome window on macOS. The browser keeps running;
+do not close its session tabs or quit Chrome.
+
+To change between a visible browser and headless operation, stop the proxy with
+`Ctrl+C` in the terminal where it is running, then use one of these commands:
 
 ```bash
+# Show the proxy's Chrome window
 GEMINI_SHOW_BROWSER=1 venv/bin/python run.py
+
+# Hide the window and run Chrome in the background
+GEMINI_SHOW_BROWSER=0 venv/bin/python run.py
 ```
 
+With `GEMINI_SHOW_BROWSER` unset, the default is headless operation after login.
+This setting is read at startup; it cannot be toggled while the proxy is running.
+Restarting preserves the Chrome login profile but interrupts in-flight requests
+and clears the proxy's in-memory session mapping. If login is missing or expired,
+the login window still opens so you can sign in.
+
+### Choosing the Gemini Model
+
+Start the proxy with `GEMINI_SHOW_BROWSER=1` as shown above.
 In that Chrome window, click the model name inside Gemini's input box and select
 an available model. Use the proxy's window, not a different Chrome profile.
 The window stays visible after login. Existing proxy session pages have their
