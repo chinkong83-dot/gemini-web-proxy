@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, Union
@@ -7,10 +7,14 @@ import asyncio
 import time
 import re
 import os
+from uuid import uuid4
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, BrowserContext, Page
 from markdownify import markdownify as md
+from conversation_sync import ConversationSync, fingerprint
 
 app = FastAPI()
 
@@ -26,9 +30,18 @@ TOOLS_MODEL = "00bx-gemini-web"
 context: BrowserContext = None
 playwright_instance = None
 is_ready = False
-session_pages: Dict[str, Page] = {}
-page_locks: Dict[str, asyncio.Lock] = {}
-session_msg_count: Dict[str, int] = {}  # Track message count per session
+
+
+@dataclass
+class BrowserSession:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    sync: ConversationSync = field(default_factory=ConversationSync)
+    page: Optional[Page] = None
+    marker: Optional[tuple] = None
+    users: int = 0
+
+
+browser_sessions: Dict[str, BrowserSession] = {}
 
 
 class Message(BaseModel):
@@ -60,6 +73,9 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
+    session_id: Optional[str] = None
+    reset_session: bool = False
+    stream_options: Optional[Dict] = None
 
 def get_content_text(content: Any) -> str:
     """Helper to extract text from string or list content"""
@@ -172,55 +188,55 @@ async def init_browser():
     print("🎯 API: http://localhost:8080/v1/chat/completions\n")
 
 
-async def get_or_create_session_page(session_id: str, start_new_chat: bool = False) -> Page:
-    global session_pages, page_locks
-    
-    if session_id not in session_pages:
-        print(f"  → New session: {session_id}")
-        
-        page = await context.new_page()
+@asynccontextmanager
+async def session_scope(key: Optional[str]):
+    session = browser_sessions.get(key) if key is not None else None
+    if session is None:
+        session = BrowserSession()
+        if key is not None:
+            browser_sessions[key] = session
+    session.users += 1
+    try:
+        async with session.lock:
+            yield session
+    finally:
+        session.users -= 1
+        if key is None:
+            if session.page and not session.page.is_closed():
+                await session.page.close()
+        elif session.users == 0 and session.page is None and browser_sessions.get(key) is session:
+            browser_sessions.pop(key, None)
+
+
+async def page_marker(page: Page) -> tuple:
+    observation = await page.evaluate("""() => {
+        const replies = document.querySelectorAll('div[id^="model-response-message-content"]');
+        const last = replies.length ? replies[replies.length - 1] : null;
+        return {url: location.href, count: replies.length, last: last ? last.innerText : ''};
+    }""")
+    return observation["url"], observation["count"], fingerprint(observation["last"])
+
+
+async def replace_session_page(session: BrowserSession) -> Page:
+    session.sync.invalidate()
+    session.marker = None
+    if session.page and not session.page.is_closed():
+        await session.page.close()
+    session.page = None
+    page = await context.new_page()
+    try:
         await page.goto('https://gemini.google.com/app')
-        await asyncio.sleep(2)
-        
-        await page.wait_for_selector('rich-textarea', timeout=15000)
-        
-        # Always start fresh for new session
-        try:
-            new_chat_btn = await page.query_selector('side-nav-action-button[data-test-id="new-chat-button"]')
-            if new_chat_btn:
-                await new_chat_btn.click()
-                await asyncio.sleep(1)
-        except:
-            pass
-        
-        await page.wait_for_selector('rich-textarea', timeout=10000)
-        session_pages[session_id] = page
-        page_locks[session_id] = asyncio.Lock()
-        print(f"  ✓ Session {session_id} ready")
-    else:
-        # Check if page is still valid
-        try:
-            _ = session_pages[session_id].url
-        except:
-            del session_pages[session_id]
-            if session_id in page_locks:
-                del page_locks[session_id]
-            return await get_or_create_session_page(session_id, start_new_chat)
-        
-        # Start new chat only if explicitly requested (new conversation)
-        if start_new_chat:
-            print(f"  → Starting new chat in session {session_id}")
-            try:
-                page = session_pages[session_id]
-                new_chat_btn = await page.query_selector('side-nav-action-button[data-test-id="new-chat-button"]')
-                if new_chat_btn:
-                    await new_chat_btn.click()
-                    await asyncio.sleep(1)
-                    await page.wait_for_selector('rich-textarea', timeout=10000)
-            except:
-                pass
-    
-    return session_pages[session_id]
+        await page.wait_for_selector('rich-textarea .ql-editor', timeout=15000)
+        marker = await page_marker(page)
+        url = urlparse(marker[0])
+        if url.scheme != "https" or url.hostname != "gemini.google.com" or url.path.rstrip('/') != '/app' or marker[1] != 0:
+            raise HTTPException(503, "Gemini did not open a fresh conversation")
+    except BaseException:
+        if not page.is_closed():
+            await page.close()
+        raise
+    session.page = page
+    return page
 
 
 def select_tools(tools: Optional[List[Tool]], tool_choice: Any = None) -> List[Tool]:
@@ -270,7 +286,8 @@ def get_chat_content(content: Any) -> str:
 
 
 def format_conversation(messages: List[Message], tools: Optional[List[Tool]] = None,
-                        tool_choice: Any = None, chat_only: bool = False) -> str:
+                        tool_choice: Any = None, chat_only: bool = False,
+                        bindings: Optional[Dict[str, tuple]] = None) -> str:
     tools = [] if chat_only else select_tools(tools, tool_choice)
     forwarded = []
     for msg in messages:
@@ -282,10 +299,13 @@ def format_conversation(messages: List[Message], tools: Optional[List[Tool]] = N
                       "arguments": json.loads(call.get("function", {}).get("arguments", "{}"))}
                      for call in msg.tool_calls]
             content = json.dumps({"tool_calls": calls}, ensure_ascii=False, separators=(",", ":"))
-        if content:
+        if content or msg.role == "tool":
             label = f"tool ({msg.name or 'tool'})" if msg.role == "tool" else msg.role
             if msg.role == "tool" and msg.tool_call_id:
                 label += f" [{msg.tool_call_id}]"
+                if bindings and msg.tool_call_id in bindings:
+                    index, name = bindings[msg.tool_call_id]
+                    label += f" (request {index + 1}: {name})"
             forwarded.append((label, content))
     if len(forwarded) == 1 and forwarded[0][0] == "user":
         conversation = forwarded[0][1]
@@ -294,6 +314,99 @@ def format_conversation(messages: List[Message], tools: Optional[List[Tool]] = N
     if tools and not chat_only:
         return format_tools_prompt(tools, tool_choice) + "\n\n" + conversation
     return conversation
+
+
+def normalize_message(message: Message, chat_only: bool) -> Optional[Message]:
+    if chat_only and message.role not in ("user", "assistant"):
+        return None
+    content = get_chat_content(message.content) if chat_only else get_content_text(message.content)
+    calls = None
+    if not chat_only and message.tool_calls:
+        calls = []
+        for call in message.tool_calls:
+            function = call.get("function")
+            if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+                raise HTTPException(400, "Invalid tool-call history")
+            arguments = function.get("arguments", "{}")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    raise HTTPException(400, "Invalid tool-call arguments")
+            if not isinstance(arguments, dict):
+                raise HTTPException(400, "Invalid tool-call arguments")
+            calls.append({"id": call.get("id"), "type": "function", "function": {
+                "name": function["name"], "arguments": json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+            }})
+    if not content and not calls and message.role != "tool":
+        return None
+    return Message(role=message.role, content=content, tool_calls=calls,
+                   tool_call_id=message.tool_call_id, name=message.name)
+
+
+def message_fingerprint(message: Message) -> str:
+    value = message.model_dump(exclude_none=True)
+    for call in value.get("tool_calls") or []:
+        call["function"]["arguments"] = json.loads(call["function"]["arguments"])
+    return fingerprint(value)
+
+
+def session_key(request: ChatRequest, http_request: Optional[Request], chat_only: bool) -> Optional[str]:
+    headers = http_request.headers if http_request else {}
+    # The affinity header can refer to a parent; prefer the actual UI session ID.
+    explicit = headers.get("x-opencode-session-id")
+    if explicit is not None and request.session_id is not None and explicit != request.session_id:
+        raise HTTPException(400, "Conflicting session IDs")
+    identity = explicit if explicit is not None else request.session_id
+    if identity is None:
+        identity = headers.get("x-opencode-session")
+    if identity is None:
+        identity = headers.get("x-session-id")
+    if identity is None:
+        return None
+    if not identity.strip() or len(identity) > 256:
+        raise HTTPException(400, "Invalid session ID")
+    channel = headers.get("x-gemini-channel")
+    if channel is not None and (not channel.strip() or len(channel) > 256):
+        raise HTTPException(400, "Invalid session channel")
+    if channel is None:
+        channel = next((line.strip() for message in request.messages
+                        if message.role in ("system", "developer")
+                        for line in get_content_text(message.content).splitlines() if line.strip()), "default")
+    mode = "chat" if chat_only else "tools"
+    return mode + ":" + fingerprint([identity, channel])
+
+
+def prepare_prompt(request: ChatRequest, session: BrowserSession, chat_only: bool,
+                   active_tools: List[Tool]):
+    messages = [value for message in request.messages
+                if (value := normalize_message(message, chat_only)) is not None]
+    instructions = [message for message in messages if message.role in ("system", "developer")]
+    history = [message for message in messages if message.role not in ("system", "developer")]
+    plan = session.sync.plan(fingerprint([message_fingerprint(message) for message in instructions]),
+                             tuple(message_fingerprint(message) for message in history), request.reset_session)
+    forwarded = messages if plan.rebuild else history[plan.start:]
+    bindings = {call["id"]: (index, call["function"]["name"])
+                for message in history for index, call in enumerate(message.tool_calls or []) if call.get("id")}
+    text = format_conversation(forwarded, chat_only=chat_only, bindings=bindings)
+    catalog = None if plan.rebuild else session.sync.catalog
+    if active_tools:
+        definitions = request.tools or active_tools
+        current_catalog = fingerprint([tool.function.model_dump(exclude_none=True) for tool in definitions])
+        if current_catalog != catalog:
+            protocol = format_tools_prompt(definitions, request.tool_choice)
+            if catalog is not None:
+                protocol = "These tool definitions replace the earlier catalogue.\n" + protocol
+            text = protocol + "\n\n" + text
+            catalog = current_catalog
+        if not plan.rebuild or isinstance(request.tool_choice, dict):
+            names = json.dumps([tool.function.name for tool in active_tools])
+            required = request.tool_choice == "required" or isinstance(request.tool_choice, dict)
+            instruction = "Request a tool in JSON." if required else "Use tools only if needed; otherwise reply normally."
+            text = f"Tools allowed for this turn: {names}. {instruction}\n\n" + text
+    elif not chat_only and catalog is not None:
+        text = "Tools are disabled for this turn; reply normally.\n\n" + text
+    return text, plan, catalog
 
 
 async def send_to_gemini(page: Page, text: str, timeout: Optional[int] = None) -> str:
@@ -401,54 +514,31 @@ def parse_tool_calls(response: str) -> Optional[List[Dict]]:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest):
+async def chat_completions(request: ChatRequest, http_request: Request = None):
     if not is_ready:
         raise HTTPException(503, "Service initializing...")
-    
     if not request.messages:
         raise HTTPException(400, "Messages required")
-
     chat_only = request.model == CHAT_MODEL
     active_tools = [] if chat_only else select_tools(request.tools, request.tool_choice)
-    conversation = format_conversation(
-        request.messages, active_tools, request.tool_choice, chat_only=chat_only
-    )
-    if not conversation.strip():
-        raise HTTPException(400, "No conversation content to forward")
-    
-    # Use system prompt hash for session ID
-    session_id = "default"
-    for msg in request.messages:
-        content_text = get_content_text(msg.content)
-        if msg.role == "system" and content_text:
-            session_id = str(hash(content_text[:100]))[:8]
-            break
-    session_id = ("chat:" if chat_only else "tools:") + session_id
-    
-    # Detect new conversation: compare current message count with what we've seen
-    # New conversation = message count reset or decreased (OpenCode started fresh)
-    current_msg_count = len(request.messages)
-    prev_msg_count = session_msg_count.get(session_id, 0)
-    
-    # It's a new conversation if:
-    # - We've never seen this session, OR
-    # - Message count is less than before (conversation was reset)
-    is_new_conversation = session_id not in session_msg_count or current_msg_count < prev_msg_count
-    
-    if is_new_conversation:
-        print(f"  🆕 New conversation detected (msgs: {current_msg_count}, prev: {prev_msg_count})")
-    
-    # Update tracked count
-    session_msg_count[session_id] = current_msg_count
-    
-    page = await get_or_create_session_page(session_id, start_new_chat=is_new_conversation)
-    
-    async with page_locks[session_id]:
-        print(f"\n📥 [{time.strftime('%H:%M:%S')}] Session:{session_id} | msgs:{current_msg_count} | {conversation[:60]}...")
-        
+    key = session_key(request, http_request, chat_only)
+    async with session_scope(key) as session:
+        if session.page is None or session.page.is_closed():
+            session.sync.invalidate()
+        elif session.marker != await page_marker(session.page):
+            session.sync.invalidate()
+        conversation, plan, catalog = prepare_prompt(request, session, chat_only, active_tools)
+        if not conversation.strip():
+            raise HTTPException(400, "No conversation content to forward")
+        if plan.rebuild:
+            await replace_session_page(session)
+        page = session.page
+        input_chars = (0 if plan.rebuild else session.sync.context_chars) + len(conversation)
+        print(f"📥 Session:{key or 'isolated'} | sync:{plan.reason} | chars:{len(conversation)}")
+        session.sync.invalidate()
         try:
             response = await send_to_gemini(page, conversation, request.timeout)
-            print(f"📤 [{time.strftime('%H:%M:%S')}] {response[:80]}...")
+            print(f"📤 Session:{key or 'isolated'} | chars:{len(response)}")
             
             # Check for tool calls
             tool_calls = None
@@ -463,7 +553,7 @@ async def chat_completions(request: ChatRequest):
                     tool_calls = []
                     for i, tc in enumerate(parsed_tools):
                         tool_calls.append({
-                            "id": f"call_{int(time.time())}_{i}",
+                            "id": f"call_{uuid4().hex}",
                             "type": "function",
                             "function": {
                                 "name": tc.get("name"),
@@ -471,7 +561,7 @@ async def chat_completions(request: ChatRequest):
                             }
                         })
                     finish_reason = "tool_calls"
-                    print(f"🔧 Tool calls detected: {[tc['function']['name'] for tc in tool_calls]}")
+                    print(f"🔧 Tool calls detected: {len(tool_calls)}")
                 elif request.tool_choice == "required" or isinstance(request.tool_choice, dict):
                     raise HTTPException(502, "Gemini did not return the required tool call")
             
@@ -484,7 +574,7 @@ async def chat_completions(request: ChatRequest):
                 msg["content"] = response
             
             result = {
-                "id": f"chatcmpl-{int(time.time())}",
+                "id": f"chatcmpl-{uuid4().hex}",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": request.model or "gemini-pro",
@@ -494,12 +584,17 @@ async def chat_completions(request: ChatRequest):
                     "finish_reason": finish_reason
                 }],
                 "usage": {
-                    "prompt_tokens": len(conversation) // 4,
+                    "prompt_tokens": input_chars // 4,
                     "completion_tokens": len(response) // 4,
-                    "total_tokens": (len(conversation) + len(response)) // 4
+                    "total_tokens": input_chars // 4 + len(response) // 4
                 }
             }
             
+            session.marker = await page_marker(page)
+            assistant = normalize_message(Message(**msg), chat_only)
+            session.sync.commit(plan, message_fingerprint(assistant) if assistant else None,
+                                catalog, input_chars + len(response))
+
             # Handle streaming
             if request.stream:
                 async def generate():
@@ -588,6 +683,10 @@ async def chat_completions(request: ChatRequest):
                         }]
                     }
                     yield f"data: {json.dumps(done_chunk)}\n\n"
+                    if request.stream_options and request.stream_options.get("include_usage"):
+                        usage_chunk = {"id": chunk_id, "object": "chat.completion.chunk",
+                                       "created": created, "model": model, "choices": [], "usage": result["usage"]}
+                        yield f"data: {json.dumps(usage_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                 
                 return StreamingResponse(generate(), media_type="text/event-stream")
@@ -597,8 +696,8 @@ async def chat_completions(request: ChatRequest):
         except HTTPException:
             raise
         except Exception as e:
-            print(f"❌ Error: {str(e)}")
-            raise HTTPException(500, str(e))
+            print(f"❌ Gemini request failed: {type(e).__name__}")
+            raise HTTPException(502, "Gemini request failed; the context will be rebuilt on the next request")
 
 
 @app.get("/v1/models")
@@ -614,7 +713,8 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    return {"status": "ready" if is_ready else "initializing", "sessions": len(session_pages)}
+    return {"status": "ready" if is_ready else "initializing",
+            "sessions": sum(session.page is not None for session in browser_sessions.values())}
 
 
 @app.post("/reset")
@@ -625,21 +725,23 @@ async def reset():
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str):
-    if session_id in session_pages:
-        try:
-            await session_pages[session_id].close()
-        except:
-            pass
-        del session_pages[session_id]
-        if session_id in page_locks:
-            del page_locks[session_id]
+    if session_id not in browser_sessions:
+        raise HTTPException(404, "Session not found")
+    async with session_scope(session_id) as session:
+        if session.page is None:
+            raise HTTPException(404, "Session not found")
+        if not session.page.is_closed():
+            await session.page.close()
+        session.page = None
+        session.marker = None
+        session.sync = ConversationSync()
         return {"status": "deleted", "session_id": session_id}
-    raise HTTPException(404, "Session not found")
 
 
 @app.get("/v1/sessions")
 async def list_sessions():
-    return {"sessions": list(session_pages.keys()), "count": len(session_pages)}
+    keys = [key for key, session in browser_sessions.items() if session.page is not None]
+    return {"sessions": keys, "count": len(keys)}
 
 
 @app.on_event("startup")
@@ -653,13 +755,18 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global context, playwright_instance
-    for page in session_pages.values():
+    global context, playwright_instance, is_ready
+    is_ready = False
+    for session in browser_sessions.values():
         try:
-            await page.close()
-        except:
+            if session.page and not session.page.is_closed():
+                await session.page.close()
+        except Exception:
             pass
-    if context:
-        await context.close()
-    if playwright_instance:
-        await playwright_instance.stop()
+    browser_sessions.clear()
+    try:
+        if context:
+            await context.close()
+    finally:
+        if playwright_instance:
+            await playwright_instance.stop()

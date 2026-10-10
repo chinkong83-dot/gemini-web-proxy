@@ -287,6 +287,8 @@ Make sure your OpenCode configuration matches exactly:
 ```
 gemini-web-proxy/
 ├── server.py          # Main proxy server
+├── conversation_sync.py # Incremental context planner
+├── checks/           # Offline synchronization checks
 ├── run.py            # Startup script
 ├── requirements.txt  # Python dependencies
 ├── README.md        # This file
@@ -304,9 +306,59 @@ OpenCode → HTTP Request → Gemini Proxy → Browser Automation → Gemini Web
 
 ### Session Management
 
-- Sessions are stored in `~/.gemini-service/`
-- Chrome profile data persists between runs
-- Login state is maintained automatically
+The first request creates a Gemini conversation with the supplied instructions,
+history, and tool definitions. Subsequent requests for the same OpenCode session
+send only new messages or tool results. Unchanged system instructions (including
+AGENTS.md) and tool definitions are not repeated. OpenCode still sends its full
+snapshot to the local proxy; the proxy computes the delta before sending to Google.
+
+Session identity comes from `x-opencode-session-id`, then the JSON `session_id`
+field, then `x-opencode-session` or `x-session-id`. Conflicting explicit header
+and body IDs are rejected. OpenCode 2.0.26 supplies the actual session header
+automatically, including for custom providers. Different logical sessions get
+separate Gemini tabs; multiple UI tabs showing the same session reuse its context.
+The proxy does not infer session identity from the number of UI tabs.
+
+Chat and Tools modes use separate contexts. Background tasks with a different
+first system-instruction line, such as title generation, use a separate channel.
+Custom clients can set `x-gemini-channel` to distinguish parallel agents or tasks.
+Do not reuse one session ID/channel for unrelated conversations. Without a session
+ID, each request uses a fresh Gemini conversation and forwards the full snapshot;
+older clients may need an upgrade to benefit from incremental forwarding.
+
+Compaction, edits/undo, changed system instructions, explicit reset, a failed or
+cancelled request, and observed changes to the owned Gemini page cause a fresh
+conversation to be bootstrapped from the current snapshot. The proxy does not
+automatically retry model requests. Same-session requests are serialized. Tool
+results retain call IDs and request order without replaying Gemini's tool-call JSON.
+
+For direct clients, keep `session_id` stable and supply the full current snapshot:
+
+```json
+{
+  "model": "00bx-gemini-web",
+  "session_id": "my-chat-1",
+  "messages": [{"role": "user", "content": "Hello!"}]
+}
+```
+
+Add `"reset_session": true` to rebuild that context on the next request. Runtime
+session mappings are kept in memory: restarting the proxy bootstraps them again.
+The login profile at `~/.gemini-service/` persists between runs. To close a runtime
+tab, use its opaque key from `GET /v1/sessions` with `DELETE /v1/sessions/{key}`.
+
+Offline checks (no Gemini requests):
+
+```bash
+venv/bin/python -m unittest discover -s checks -p '*_checks.py' -v
+```
+
+A local mock integration with the desktop's native OpenCode 2.0.26 CLI verified
+first turn, session resume, a separate new session, and a shell-tool round trip.
+Forwarded prompt lengths were 4,026 then 108 characters; returning the result of
+`printf` needed 181 characters. AGENTS.md and unchanged tool definitions appeared
+on the first turn only. OpenCode CLI 1.18.32 also passed the mock round trip.
+These checks send no requests to Gemini; live long-context retention is unvalidated.
 
 ### Tool Calling
 
@@ -330,7 +382,9 @@ prompt size also includes the client-supplied tool schemas and instructions.
 Each tool round trip normally needs another Gemini response after OpenCode
 returns the result. OpenCode may also request session titles or other background
 responses. These requests consume the same account's usage; one user task does
-not necessarily equal one Gemini prompt.
+not necessarily equal one Gemini prompt. Incremental forwarding reduces repeated
+input transmission; Google still processes the retained conversation, so this
+does not guarantee lower account usage.
 
 For work accounts, check Gemini **Settings → Usage Limits** and the
 [official Workspace limits](https://support.google.com/gemini/answer/14620100).
@@ -348,14 +402,13 @@ by your organization. Workspace activity retention is administrator-controlled.
   tool-result text without secret redaction. Chat mode forwards the selected
   conversation text without secret redaction. If OpenCode reads a credential
   file in Tools mode, its output can be included in a prompt sent to Google.
-- Console output currently includes the first 60 characters of the formatted
-  prompt and the first 80 characters of the response. Sensitive text within
-  those snippets will be logged.
+- Request logs contain opaque session keys, synchronization reasons, character
+  counts, and tool-call counts; prompt/response snippets are not logged.
 - API routes have no authentication. Loopback binding limits network exposure,
   but other local clients can call the API using the saved Google session.
-- Conversations are grouped by a hash of the first 100 characters of their
-  system prompt, or `default` if none is present. Separate OpenCode conversations
-  can share a Gemini chat; there is no per-client conversation isolation.
+- Supplied session IDs separate logical conversations; they are not credentials
+  and do not authenticate local clients. A caller using another client's ID and
+  channel can access that runtime context.
 - `/reset` removes only the `logged-in` flag. It does not clear cookies, close
   active browser sessions, or revoke the Google login.
 
@@ -367,9 +420,12 @@ by your organization. Workspace activity retention is administrator-controlled.
 - Rate limited by Gemini's web interface limits
 - Session tabs remain open until explicitly deleted or the proxy stops; there
   is no automatic eviction
-- The full supplied conversation is forwarded on every turn, including when
-  its Gemini page already has history. Long chats therefore repeat earlier
-  content; large-context reliability has not been validated.
+- History is replayed when rebuilding a context or when no session ID is supplied.
+  Incremental forwarding reduces repeated input, but does not expand Google's
+  context limit or prevent Gemini from forgetting earlier content.
+- Usage is a rough character-count estimate of the retained browser context,
+  not Google's tokenizer or billing. Streaming includes it when the client asks
+  for `stream_options.include_usage`; it is not just the latest delta's size.
 - Interrupted shutdown may log a Playwright driver-connection error even
   though the proxy process exits. Restarting the service worked in local tests.
 
