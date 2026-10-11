@@ -299,6 +299,7 @@ Make sure your OpenCode configuration matches exactly:
 gemini-web-proxy/
 ├── server.py          # Main proxy server
 ├── conversation_sync.py # Incremental context planner
+├── prompt_compaction.py # Guarded metadata-description compaction
 ├── checks/           # Offline synchronization checks
 ├── run.py            # Startup script
 ├── requirements.txt  # Python dependencies
@@ -407,12 +408,35 @@ call IDs linking previous tool requests to their results. It
 does not add access/permission claims, force tools for ordinary conversation,
 or rewrite write/edit arguments with code-block placeholders. Only structured
 tool-call JSON for currently available tools is returned as an executable call.
-OpenCode's own system prompt and tool descriptions can still be long in Tools
-mode; the proxy forwards those instead of silently shortening their contracts.
+Complete parameter schemas and user rules remain unchanged in Tools mode.
 The protocol identifies OpenCode as the external executor; Gemini is asked to
-produce JSON requests rather than execute commands inside the web app. For one
-small example tool, the wrapper decreased from 5,135 to 552 characters. Actual
-prompt size also includes the client-supplied tool schemas and instructions.
+produce JSON requests rather than execute commands inside the web app. Actual
+prompt size also includes client-supplied schemas and instructions.
+
+### Prompt Compaction
+
+The proxy shortens recognized OpenCode tool descriptions, two repeated Harness
+instructions, and recognized descriptions in the initial skills directory.
+Matching uses tool/skill IDs and fingerprints of known description text.
+Unknown or customized descriptions pass through verbatim. Every parameter-schema
+field is preserved, including descriptions, required fields, enums, defaults,
+bounds and nested types. Code Mode instructions/signatures remain unchanged.
+
+In Tools mode, skills keep their IDs, names and concise purposes/triggers.
+Gemini can use that initial directory to select a skill on later turns; the
+`skill` tool loads its full instructions, which are forwarded without compaction.
+The directory is sent again when the context is rebuilt. User AGENTS.md sections,
+environment details, user messages, tool results and control updates are preserved.
+Chat mode continues to forward only conversation text with tools disabled.
+
+For a sample with twelve tools and twelve skills, formatted bootstrap size
+decreased from 25,977 to 19,023 characters: 6,954 fewer (26.8%). A native OpenCode
+2.0.26 mock integration replaying that metadata verified session resume/isolation
+and a `printf` tool round trip. Its first turn used 19,045 characters, the next
+turn 218, and the tool-result turn 291; unchanged directories/schemas were not
+repeated. Chat forwarded just its 13-character user message. These are character
+counts, not tokenizer counts. The checks added no live Gemini requests; model
+selection quality after compaction has not been evaluated with live Gemini.
 
 Each tool round trip normally needs another Gemini response after OpenCode
 returns the result. OpenCode may also request session titles or other background

@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright, BrowserContext, Page
 from markdownify import markdownify as md
 from conversation_sync import ConversationSync, fingerprint
+from prompt_compaction import compact_tool_definition, compact_system_prompt
 
 app = FastAPI()
 
@@ -263,13 +264,13 @@ def format_tools_prompt(tools: List[Tool], tool_choice: Any = None) -> str:
     instruction = "Use a listed tool only when needed; otherwise answer normally."
     if tool_choice == "required" or isinstance(tool_choice, dict):
         instruction = "Call a listed tool in this response."
-    definitions = [tool.function.model_dump(exclude_none=True) for tool in tools]
+    definitions = [compact_tool_definition(tool.function.model_dump(exclude_none=True)) for tool in tools]
     return (
         "An external OpenCode client executes JSON tool requests and returns results. "
         "You only produce the request; do not execute commands yourself.\n"
         f"{instruction}\n"
-        'For tool calls, return only JSON, without prose or Markdown: {"tool_calls":[{"name":"tool_name","arguments":{}}]}.\n'
-        "Follow the supplied parameter schemas; put actual values in arguments.\n"
+        'Tool calls: JSON only, no prose/fences: {"tool_calls":[{"name":"tool_name","arguments":{}}]}. '
+        "Use real arguments matching the supplied schemas.\n"
         f"Tools: {json.dumps(definitions, ensure_ascii=False, separators=(',', ':'))}"
     )
 
@@ -294,6 +295,8 @@ def format_conversation(messages: List[Message], tools: Optional[List[Tool]] = N
         if chat_only and msg.role not in ("user", "assistant"):
             continue
         content = get_chat_content(msg.content) if chat_only else get_content_text(msg.content)
+        if not chat_only and msg.role in ("system", "developer"):
+            content = compact_system_prompt(content)
         if not chat_only and msg.role == "assistant" and msg.tool_calls:
             calls = [{"id": call.get("id"), "name": call.get("function", {}).get("name"),
                       "arguments": json.loads(call.get("function", {}).get("arguments", "{}"))}
