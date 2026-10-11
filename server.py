@@ -409,6 +409,51 @@ def prepare_prompt(request: ChatRequest, session: BrowserSession, chat_only: boo
     return text, plan, catalog
 
 
+async def read_response_snapshot(page: Page) -> Dict[str, Any]:
+    return await page.evaluate('''() => {
+        const replies = [...document.querySelectorAll('div[id^="model-response-message-content"]')];
+        const reply = replies[replies.length - 1];
+        if (!reply) return {count: 0, finished: false};
+        const container = reply.closest('model-response');
+        const hasAction = name => !!container && [...container.querySelectorAll(
+            `button [data-mat-icon-name="${name}"]`
+        )].some(icon => icon.closest('button').getClientRects().length > 0);
+        return {
+            count: replies.length,
+            id: reply.id,
+            html: reply.innerHTML,
+            text: reply.innerText || reply.textContent || '',
+            finished: reply.getAttribute('aria-busy') === 'false'
+                && hasAction('thumb_up') && hasAction('copy')
+        };
+    }''')
+
+
+async def wait_for_complete_response(page: Page, previous_count: int, timeout: int) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    previous = None
+    stable_count = 0
+    while time.monotonic() < deadline:
+        try:
+            snapshot = await read_response_snapshot(page)
+        except Exception:
+            previous = None
+            stable_count = 0
+        else:
+            # A pause in streaming is not a completed response.
+            if snapshot['count'] > previous_count and snapshot['finished'] and snapshot.get('text', '').strip():
+                current = (snapshot['id'], snapshot['html'], snapshot['text'])
+                stable_count = stable_count + 1 if current == previous else 0
+                previous = current
+                if stable_count >= 2:
+                    return snapshot
+            else:
+                previous = None
+                stable_count = 0
+        await asyncio.sleep(0.3)
+    raise TimeoutError("Gemini response did not finish before the request timeout")
+
+
 async def send_to_gemini(page: Page, text: str, timeout: Optional[int] = None) -> str:
     if timeout is None:
         timeout = 300  # 5 minute default
@@ -443,52 +488,17 @@ async def send_to_gemini(page: Page, text: str, timeout: Optional[int] = None) -
     
     await asyncio.sleep(1)
     
-    response_text = None
-    start_time = time.time()
-    previous_length = 0
-    stable_count = 0
-    
-    while (time.time() - start_time) < timeout:
-        try:
-            response_divs = await page.query_selector_all('div[id^="model-response-message-content"]')
-            
-            # Only process if we have a NEW response
-            if len(response_divs) > response_count_before:
-                # Get the newest response (last one)
-                last_response = response_divs[-1]
-                current_text = await last_response.evaluate('(el) => el.innerHTML')
-                
-                if current_text:
-                    if len(current_text) == previous_length:
-                        stable_count += 1
-                        if stable_count >= 2:
-                            response_text = current_text
-                            break
-                    else:
-                        previous_length = len(current_text)
-                        stable_count = 0
-        except:
-            pass
-        await asyncio.sleep(0.3)
-    
-    if not response_text:
-        raise Exception(f"Timeout after {timeout}s")
-    
-    # Preserve JSON text before converting ordinary replies to Markdown.
-    extraction = await page.evaluate('''() => {
-        const lastResponse = [...document.querySelectorAll('div[id^="model-response-message-content"]')].pop();
-        if (!lastResponse) return { text: '' };
-        const text = lastResponse.innerText || lastResponse.textContent || '';
-        return { text };
-    }''')
-    
-    text_content = extraction.get("text", "").strip()
+    completed = await wait_for_complete_response(page, response_count_before, timeout)
+    response_text = completed['html']
+    text_content = completed['text'].strip()
     parsed_tools = parse_tool_calls(text_content)
     if parsed_tools:
         return json.dumps({"tool_calls": parsed_tools}, ensure_ascii=False)
 
     # No tool calls - convert HTML to markdown
-    response_text = md(response_text, heading_style="ATX", code_language_callback=lambda el: el.get('class', [''])[0].replace('language-', '') if el.get('class') else '')
+    response_text = md(response_text, heading_style="ATX", code_language_callback=lambda el: next(
+        (name[len('language-'):] for name in el.get('class', []) if name.startswith('language-')), ''
+    ))
     
     return response_text.strip()
 

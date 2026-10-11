@@ -274,6 +274,17 @@ venv/bin/python run.py
 3. Verify your Google account has Gemini access and `/health` reports `ready`
 4. Try restarting the proxy
 
+To keep logs available from a shell, start the proxy with output redirected:
+
+```bash
+mkdir -p ~/.gemini-service
+venv/bin/python -u run.py >> ~/.gemini-service/proxy.log 2>&1
+```
+
+Read them with `tail -n 50 ~/.gemini-service/proxy.log`. Request metadata includes
+`Session`, `sync`, and `chars`; `sync:delta` means the existing conversation was
+reused. Output sent only to a terminal is not automatically saved to a log file.
+
 ### OpenCode Configuration
 
 Make sure your OpenCode configuration matches exactly:
@@ -359,6 +370,30 @@ Forwarded prompt lengths were 4,026 then 108 characters; returning the result of
 `printf` needed 181 characters. AGENTS.md and unchanged tool definitions appeared
 on the first turn only. OpenCode CLI 1.18.32 also passed the mock round trip.
 These checks send no requests to Gemini; live long-context retention is unvalidated.
+
+### Complete Replies
+
+The proxy waits for the newest response's `aria-busy="false"` and visible copy
+and feedback controls, then confirms the complete HTML and text remain stable.
+A pause during generation is not treated as completion. HTML and text are read
+from one snapshot so tool-call JSON and ordinary replies use the same finished
+response. If completion cannot be confirmed before the request timeout, the
+proxy returns an error without forwarding a partial answer or automatically
+retrying the model request.
+
+Prematurely reading a paused response can truncate a list or tool-call JSON.
+If Gemini subsequently finishes that response, the page fingerprint changes
+and the next request rebuilds the context. Completion checks prevent that
+failure path while preserving detection of manual page changes. OpenCode title
+generation still uses a separate Gemini conversation; it is an additional
+background model request, not a second main conversation.
+
+A bounded live check with OpenCode 2.0.26 received all five entries of a supplied
+repository-name list. A separate tool/error-result round trip used `sync:delta`
+with the same session key. Together these checks used three Gemini requests.
+The live repository lookup could not authenticate in the isolated test environment:
+temporary `XDG_CONFIG_HOME` also isolated gh's settings. The list check used names
+already retrieved by the user, so it did not revalidate fresh GitHub access.
 
 ### Tool Calling
 
