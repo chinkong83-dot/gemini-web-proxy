@@ -117,7 +117,7 @@ class CompactionChecks(unittest.TestCase):
                                                     state, False, [changed])
         self.assertFalse(plan.rebuild)
         self.assertIn(changed.function.description, replacement)
-        self.assertIn('replace the earlier catalogue', replacement)
+        self.assertIn('Update the tool catalogue', replacement)
 
     def test_changed_raw_system_rules_still_rebuild_and_updates_remain_verbatim(self):
         history = [server.Message(role='system', content=system_text()), server.Message(role='user', content='FIRST')]

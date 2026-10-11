@@ -321,7 +321,11 @@ OpenCode → HTTP Request → Gemini Proxy → Browser Automation → Gemini Web
 The first request creates a Gemini conversation with the supplied instructions,
 history, and tool definitions. Subsequent requests for the same OpenCode session
 send only new messages or tool results. Unchanged system instructions (including
-AGENTS.md) and tool definitions are not repeated. OpenCode still sends its full
+AGENTS.md), tool definitions, and the normal allowed-tool list are not repeated.
+A changed catalogue sends complete replacements only for changed or added names
+and explicit removed names. Required or forced tool use still applies to each
+response; changing tool availability sends an updated policy. OpenCode still
+sends its full
 snapshot to the local proxy; the proxy computes the delta before sending to Google.
 
 Session identity comes from `x-opencode-session-id`, then the JSON `session_id`
@@ -396,6 +400,41 @@ The live repository lookup could not authenticate in the isolated test environme
 temporary `XDG_CONFIG_HOME` also isolated gh's settings. The list check used names
 already retrieved by the user, so it did not revalidate fresh GitHub access.
 
+### Request Monitoring and Stop Conditions
+
+Use one proxy process with one ledger. Model requests across sessions and
+background channels are serialized. To count submissions and stop after an
+error without a fixed request cap:
+
+```bash
+GEMINI_STOP_ON_ERROR=1 \
+GEMINI_REQUEST_LEDGER=/tmp/Codex-gemini-run-ledger.json \
+venv/bin/python -u run.py
+```
+
+For a bounded run, also set `GEMINI_REQUEST_LIMIT` to a positive integer.
+A bound requires a ledger, and its recorded limit must match on restart.
+`GET /v1/request-budget` returns count, limit, and the stopped reason; it contains
+no conversation text. Counts are reserved immediately before a single send click.
+An uncertain click still consumes its reservation; there is no Enter fallback.
+The send control supports the observed English and Chinese labels.
+
+Explicit usage-limit notices in the latest reply or visible UI, and HTTP 429
+from Gemini, stop subsequent submissions. In a monitored or bounded run, three
+identical replies in the same runtime session also stop the run as a possible
+limit or bridge fault. An
+unconfirmed response times out rather than returning partial text. With
+`GEMINI_STOP_ON_ERROR=1`, failures and cancellations latch a stop, so client
+retries cannot submit again. Stopped requests return HTTP 400 without retrying.
+The ledger preserves counts and stopped state across restarts; runtime browser
+conversation mappings still do not survive a restart.
+
+UI detection covers English/Chinese limit wording and visible notices, not every
+possible future Gemini UI. A timeout or repeated reply is a suspicion, not proof
+of an account quota. This proxy cannot determine remaining account allowance.
+Inspect the UI and reported reason before deciding whether work can resume;
+never clear a real quota stop to continue submitting requests.
+
 ### Tool Calling
 
 The proxy prompts Gemini to produce tool-call JSON, then translates the output
@@ -425,8 +464,14 @@ bounds and nested types. Code Mode instructions/signatures remain unchanged.
 In Tools mode, skills keep their IDs, names and concise purposes/triggers.
 Gemini can use that initial directory to select a skill on later turns; the
 `skill` tool loads its full instructions, which are forwarded without compaction.
-The directory is sent again when the context is rebuilt. User AGENTS.md sections,
-environment details, user messages, tool results and control updates are preserved.
+The directory is sent again when the context is rebuilt. Exact repeated
+user-role `system-update` blocks containing only the recognized skills directory
+are omitted from an outgoing delta when that directory is still current.
+A directory that changes and later switches back is forwarded again. Other
+updates, per-turn reminders, permissions, mixed text, and loaded skill bodies
+are preserved. Raw client history and fingerprints remain unchanged.
+User AGENTS.md sections, environment details, ordinary user messages, tool
+results and other control updates are preserved.
 Chat mode continues to forward only conversation text with tools disabled.
 
 For a sample with twelve tools and twelve skills, formatted bootstrap size

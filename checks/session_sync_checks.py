@@ -94,7 +94,8 @@ class BrowserChecks(unittest.IsolatedAsyncioTestCase):
         self.sent = []
         self.responses = []
         self.output = io.StringIO()
-        self.patches = [patch.object(server, "context", self.browser), patch.object(server, "is_ready", True),
+        self.patches = [patch.object(server, "model_request_lock", asyncio.Lock()),
+                        patch.object(server, "context", self.browser), patch.object(server, "is_ready", True),
                         patch.object(server, "send_to_gemini", self.send), contextlib.redirect_stdout(self.output)]
         for item in self.patches:
             item.__enter__()
@@ -226,10 +227,10 @@ class BrowserChecks(unittest.IsolatedAsyncioTestCase):
         first = await self.call(initial, tools=[tool])
         history = initial + [first["choices"][0]["message"], {"role": "user", "content": "B"}]
         second = await self.call(history, tools=[tool], tool_choice="none")
-        self.assertIn("Tools are disabled for this turn", self.sent[-1][1])
+        self.assertIn("Tools are disabled", self.sent[-1][1])
         self.assertNotIn("SCHEMA_MARKER", self.sent[-1][1])
         await self.call(history + [second["choices"][0]["message"], {"role": "user", "content": "C"}], tools=[tool])
-        self.assertIn('Tools allowed for this turn: ["read"]', self.sent[-1][1])
+        self.assertIn('Available tools: ["read"]', self.sent[-1][1])
         self.assertNotIn("SCHEMA_MARKER", self.sent[-1][1])
 
     async def test_explicit_reset_and_regeneration_create_fresh_pages(self):
